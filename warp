@@ -1,4 +1,3 @@
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -164,28 +163,56 @@ local function SafeWalkTo(targetX, targetY)
 end
 
 -- === The Main Controller ===
+-- === The Main Controller (With Strict Verification) ===
 local function PathfindToTile(targetGridX, targetGridY)
     -- Calculate where we currently are on the grid
     local startGridX = worldToGrid(PlayerMovement.Position.X)
     local startGridY = worldToGrid(PlayerMovement.Position.Y)
+
+    -- If we are already there, don't do anything!
+    if startGridX == targetGridX and startGridY == targetGridY then
+        print("✅ Already at destination!")
+        return true
+    end
 
     print(string.format("Calculating path from Grid(%d, %d) to Grid(%d, %d)...", startGridX, startGridY, targetGridX, targetGridY))
     
     local path = getPath(startGridX, startGridY, targetGridX, targetGridY)
     
     if path then
-        print(string.format("✅ Path found! %d tiles to walk.", #path))
+        print(string.format("Path found! %d tiles to walk.", #path))
+        
         -- Walk the path using studs
         for i = 2, #path do
             local waypoint = path[i]
             SafeWalkTo(waypoint.X, waypoint.Y)
+            
+            -- === 🛑 STRICT VERIFICATION STEP 🛑 ===
+            -- Give the server a tiny fraction of a second to sync
+            task.wait(0.05) 
+            
+            local actualGridX = worldToGrid(PlayerMovement.Position.X)
+            local actualGridY = worldToGrid(PlayerMovement.Position.Y)
+            local expectedGridX = worldToGrid(waypoint.X)
+            local expectedGridY = worldToGrid(waypoint.Y)
+            
+            -- Did we actually arrive at the tile we just tried to walk to?
+            if actualGridX ~= expectedGridX or actualGridY ~= expectedGridY then
+                warn(string.format("⚠️ Bot was shifted! Expected: (%d, %d), Actually at: (%d, %d)", expectedGridX, expectedGridY, actualGridX, actualGridY))
+                print("🔄 Recalculating path from current position...")
+                
+                -- Stop following the broken path, and start a fresh one!
+                return PathfindToTile(targetGridX, targetGridY)
+            end
         end
-        print("Safely arrived at destination!")
+        
+        print("✅ Safely arrived at destination!")
+        return true
     else
         warn("❌ Cannot reach that tile. It might be blocked or outside the map bounds!")
+        return false
     end
 end
-
 -- === TEST IT OUT ===
 -- Tell the bot to walk to Grid Coordinate (57, 34) where you placed that sapling earlier!
 for x = 0, 101, 1 do
@@ -194,3 +221,4 @@ PathfindToTile(x, y)
         
     end
 end
+--x
