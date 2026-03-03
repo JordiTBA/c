@@ -1,1 +1,196 @@
 
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local PlayerMovement = require(player.PlayerScripts:WaitForChild("PlayerMovement"))
+local moveRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("PlayerMovementPackets"):WaitForChild(player.Name)
+local WorldManager = require(ReplicatedStorage.Managers.WorldManager)
+
+local GRID_SIZE = 4.5
+
+-- === Grid Conversion Helpers ===
+local function worldToGrid(pos)
+    return math.floor(pos / GRID_SIZE + 0.5)
+end
+
+local function gridToWorld(gridPos)
+    return gridPos * GRID_SIZE
+end
+
+-- === BOUNDARY & WALKABILITY CHECK ===
+local function isWalkable(gridX, gridY)
+    -- 1. Get the current world boundaries
+    local worldMin = workspace:GetAttribute("WorldMin")
+    local worldMax = workspace:GetAttribute("WorldMax")
+    
+    -- 2. Check if the tile is off the edge of the map
+    if worldMin and worldMax then
+        if gridX < worldMin.X or gridX > worldMax.X or gridY < worldMin.Y or gridY > worldMax.Y then
+            return false -- Out of bounds! Not walkable.
+        end
+    end
+
+    -- 3. If it's inside the map, check if it's empty or a sapling
+    local tile = WorldManager.GetTile(gridX, gridY, 1)
+    
+    if not tile then 
+        return true -- Empty space
+    end
+    
+    if type(tile) == "string" and tile:sub(-8) == "_sapling" then
+        return true -- Walkable sapling
+    end
+    
+    return false -- Solid block
+end
+
+-- === A* Pathfinding Algorithm (Strictly using Grid Tiles) ===
+local function getPath(startGridX, startGridY, targetGridX, targetGridY)
+    local openList = {}
+    local closedList = {}
+    
+    local startNode = {x = startGridX, y = startGridY, g = 0, h = 0, f = 0, parent = nil}
+    table.insert(openList, startNode)
+    
+    local iterations = 0
+    local maxIterations = 2000 
+    
+    while #openList > 0 do
+        iterations = iterations + 1
+        if iterations > maxIterations then
+            warn("Pathfinding timed out!")
+            return nil
+        end
+        
+        -- Find node with lowest F cost
+        local currentIndex = 1
+        local currentNode = openList[1]
+        for i, node in ipairs(openList) do
+            if node.f < currentNode.f then
+                currentNode = node
+                currentIndex = i
+            end
+        end
+        
+        table.remove(openList, currentIndex)
+        local closedKey = currentNode.x .. "_" .. currentNode.y
+        closedList[closedKey] = true
+        
+        -- Did we reach the target tile?
+        if currentNode.x == targetGridX and currentNode.y == targetGridY then
+            local path = {}
+            local current = currentNode
+            while current do
+                -- Convert the final grid path back to Studs for the bot to walk
+                table.insert(path, 1, Vector2.new(gridToWorld(current.x), gridToWorld(current.y)))
+                current = current.parent
+            end
+            return path
+        end
+        
+        -- Check Up, Down, Left, Right
+        local neighbors = {
+            {x = currentNode.x, y = currentNode.y - 1},
+            {x = currentNode.x, y = currentNode.y + 1},
+            {x = currentNode.x - 1, y = currentNode.y},
+            {x = currentNode.x + 1, y = currentNode.y}
+        }
+        
+        for _, neighborPos in ipairs(neighbors) do
+            local nKey = neighborPos.x .. "_" .. neighborPos.y
+            
+            -- This single function call now checks boundaries AND blocks!
+            if closedList[nKey] or not isWalkable(neighborPos.x, neighborPos.y) then
+                continue
+            end
+            
+            local gCost = currentNode.g + 1
+            local hCost = math.abs(neighborPos.x - targetGridX) + math.abs(neighborPos.y - targetGridY)
+            local fCost = gCost + hCost
+            
+            local inOpenList = false
+            for _, openNode in ipairs(openList) do
+                if openNode.x == neighborPos.x and openNode.y == neighborPos.y then
+                    inOpenList = true
+                    if gCost < openNode.g then
+                        openNode.g = gCost
+                        openNode.f = fCost
+                        openNode.parent = currentNode
+                    end
+                    break
+                end
+            end
+            
+            if not inOpenList then
+                table.insert(openList, {
+                    x = neighborPos.x, 
+                    y = neighborPos.y, 
+                    g = gCost, 
+                    h = hCost, 
+                    f = fCost, 
+                    parent = currentNode
+                })
+            end
+        end
+    end
+    
+    return nil
+end
+
+-- === Movement Execution ===
+local function SafeWalkTo(targetX, targetY)
+    local startPos = PlayerMovement.Position
+    local startX = startPos.X
+    local startY = startPos.Y
+    local distance = math.sqrt((targetX - startX)^2 + (targetY - startY)^2)
+    
+    if distance < 0.1 then return end 
+
+    local walkSpeed = 20 
+    local packetDelay = 0.05
+    local totalSteps = math.max(1, math.floor((distance / walkSpeed) / packetDelay))
+
+    for step = 1, totalSteps do
+        local t = step / totalSteps
+        local currentX = startX + (targetX - startX) * t
+        local currentY = startY + (targetY - startY) * t
+        PlayerMovement.Position = Vector3.new(currentX, currentY, startPos.Z)
+        moveRemote:FireServer(Vector2.new(currentX, currentY))
+        task.wait(packetDelay) 
+    end
+    PlayerMovement.Position = Vector3.new(targetX, targetY, startPos.Z)
+    moveRemote:FireServer(Vector2.new(targetX, targetY))
+end
+
+-- === The Main Controller ===
+local function PathfindToTile(targetGridX, targetGridY)
+    -- Calculate where we currently are on the grid
+    local startGridX = worldToGrid(PlayerMovement.Position.X)
+    local startGridY = worldToGrid(PlayerMovement.Position.Y)
+
+    print(string.format("Calculating path from Grid(%d, %d) to Grid(%d, %d)...", startGridX, startGridY, targetGridX, targetGridY))
+    
+    local path = getPath(startGridX, startGridY, targetGridX, targetGridY)
+    
+    if path then
+        print(string.format("✅ Path found! %d tiles to walk.", #path))
+        -- Walk the path using studs
+        for i = 2, #path do
+            local waypoint = path[i]
+            SafeWalkTo(waypoint.X, waypoint.Y)
+        end
+        print("Safely arrived at destination!")
+    else
+        warn("❌ Cannot reach that tile. It might be blocked or outside the map bounds!")
+    end
+end
+
+-- === TEST IT OUT ===
+-- Tell the bot to walk to Grid Coordinate (57, 34) where you placed that sapling earlier!
+for x = 0, 101, 1 do
+    for y = 0, 60, 1 do
+PathfindToTile(x, y)
+        
+    end
+end
